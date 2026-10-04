@@ -428,8 +428,8 @@ ok_q = {"reconciliation_no": "REC-1-Q", "receiver": "李四",
 r = recon("BATCH-Q", ok_q)
 check("失败过的单号/批次修正后成功 201", r.status_code == 201, r.text)
 
-# ---------------------------------------------------------------- 5. 核定交互与已核定
-print("5) 已核定样本的收妥项 409 sample_approved；核定后同号同内容仍幂等")
+# ---------------------------------------------------------------- 5. 核定交互与已核定（历史冻结）
+print("5) 批内任一样本已核定：收妥/异常任一形态均整单 409 sample_approved，不留记录")
 for c in ("K1", "K2"):
     reg(c)
 make_batch("BATCH-K", codes=("K1", "K2"), prefix="KT")
@@ -445,26 +445,69 @@ ev({"event_id": "K1-S", "event_type": "storage", "sample_code": "K1",
 # 批量移交单号也是 TR-K1 → 单签关闭的正是批量这笔）。核定：
 ar = client.post(f"{API}/samples/K1/approve", json={"approver": "质量主管"})
 check("K1 核定成功", ar.status_code == 200, ar.text)
+# 5.1 已核定份按收妥项提交 → 409 sample_approved
 r = recon("BATCH-K", {"reconciliation_no": "REC-K", "receiver": "李四",
                       "occurred_at": "2026-09-30T04:00:00Z",
                       "items": [recv_item("K1", "K1-RR"), exc_item("K2")]})
 check("已核定样本的收妥项 409 sample_approved（冲突优先，整单不留）",
-      r.status_code == 409 and err_codes(r) == {"sample_approved"}, r.text)
-# 已核定份按异常提交、K2 收妥 → 成功（异常仅留记录，不触及冻结历史）
+      r.status_code == 409 and r.json()["error"]["code"] == "reconciliation_rejected"
+      and err_codes(r) == {"sample_approved"}, r.text)
+# 5.2 已核定份按异常项提交（仅填原因）→ 同样整单 409 sample_approved：
+#     异常项不得绕过历史冻结；混合清单也不得为其他样本落签收事件与版本
+k2_ver_before = versions("K2")["current_version"]
 r = recon("BATCH-K", {"reconciliation_no": "REC-K", "receiver": "李四",
                       "occurred_at": "2026-09-30T04:00:00Z",
                       "items": [exc_item("K1", "样本此前已完成单签并核定入库，列异常说明"),
                                 recv_item("K2", "K2-R")]})
-check("已核定份按异常提交不写历史：201", r.status_code == 201, r.text)
-check("K1 事件数不变（4）、无对账 receive",
-      len(chain("K1")["timeline"]) == 4, str(len(chain("K1")["timeline"])))
+check("已核定样本按异常项提交也整单 409 reconciliation_rejected/sample_approved",
+      r.status_code == 409 and r.json()["error"]["code"] == "reconciliation_rejected"
+      and err_codes(r) == {"sample_approved"}, r.text)
+check("明细标出已核定份（index=0/sample_code=K1/code=sample_approved）",
+      any(i.get("index") == 0 and i.get("sample_code") == "K1"
+          and i.get("code") == "sample_approved"
+          for i in r.json()["error"]["details"]["items"]), r.text)
+check("整单不留对账记录（查询 404 reconciliation_not_found）",
+      get_recon("BATCH-K").status_code == 404
+      and get_recon("BATCH-K").json()["error"]["code"] == "reconciliation_not_found")
+check("整单不留签收事件：K1 仍 4 条事件、K2 仍 1 条 transfer（无对账 receive）",
+      len(chain("K1")["timeline"]) == 4 and len(chain("K2")["timeline"]) == 1
+      and db_scalar("SELECT COUNT(*) FROM custody_event WHERE event_id='K2-R'") == 0)
+check("整单不产生新版本：K2 版本不变",
+      versions("K2")["current_version"] == k2_ver_before)
+check("失败的签收单号未占用（数据库无 REC-K 对账头/明细）",
+      db_scalar("SELECT COUNT(*) FROM batch_reconciliation WHERE reconciliation_no='REC-K'") == 0)
 
-# 核定后同单号同内容重试仍 200 幂等（对账查询照回原结果）
-r = recon("BATCH-K", {"reconciliation_no": "REC-K", "receiver": "李四",
-                      "occurred_at": "2026-09-30T04:00:00Z",
-                      "items": [exc_item("K1", "样本此前已完成单签并核定入库，列异常说明"),
-                                recv_item("K2", "K2-R")]})
-check("核定后同单号同内容重试 200", r.status_code == 200 and r.json()["idempotent"] is True)
+# 5.3 未核定批次：收妥资格与异常留痕规则不变（混合清单 201）
+for c in ("K3", "K4"):
+    reg(c)
+make_batch("BATCH-K2", codes=("K3", "K4"), prefix="K2T")
+body_k2 = {"reconciliation_no": "REC-K2", "receiver": "李四",
+           "occurred_at": "2026-09-30T03:00:00Z",
+           "items": [recv_item("K3", "K3-R"), exc_item("K4", "封签破损，异常拒收")]}
+r = recon("BATCH-K2", body_k2)
+check("未核定批次混合清单 201（异常留痕规则不变）",
+      r.status_code == 201 and r.json()["reconciliation"]["received_count"] == 1
+      and r.json()["reconciliation"]["exception_count"] == 1, r.text)
+
+# 5.4 成功对账后样本再核定：同单号同内容重试仍 200 返回原结果（幂等判定先于冻结校验）
+ev({"event_id": "K3-C", "event_type": "seal_check", "sample_code": "K3",
+    "occurred_at": "2026-09-30T03:30:00Z", "checked_seal_no": "SEAL-K3", "seal_intact": True})
+ev({"event_id": "K3-S", "event_type": "storage", "sample_code": "K3",
+    "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+ar = client.post(f"{API}/samples/K3/approve", json={"approver": "质量主管"})
+check("对账成功后 K3 补齐链并核定", ar.status_code == 200, ar.text)
+r = recon("BATCH-K2", body_k2)
+check("核定后同单号同内容重试 200 幂等返回原结果",
+      r.status_code == 200 and r.json()["idempotent"] is True
+      and r.json()["reconciliation"]["reconciliation_no"] == "REC-K2", r.text)
+# 异内容 / 新单号重提仍按既有冲突规则
+bad_k2 = dict(body_k2, items=[recv_item("K3", "K3-R"), exc_item("K4", "改动后的原因")])
+r = recon("BATCH-K2", bad_k2)
+check("核定后同单号异内容 409 reconciliation_conflict",
+      r.status_code == 409 and r.json()["error"]["code"] == "reconciliation_conflict", r.text)
+r = recon("BATCH-K2", dict(body_k2, reconciliation_no="REC-K2-NEW"))
+check("核定后新单号重提 409 batch_already_reconciled",
+      r.status_code == 409 and r.json()["error"]["code"] == "batch_already_reconciled", r.text)
 
 # ---------------------------------------------------------------- 6. 查询呈现现时有效性，不改写原对账
 print("6) 纠错后查询：原对账收妥/异常明细不变，event_effective/current_event_id 反映现时")
@@ -624,7 +667,7 @@ check("全异常后该批不能再对账（一次性），但既有单签接口�
 
 # ---------------------------------------------------------------- 10. 数据库层终态核对
 print("10) 数据库层终态：对账头/明细数量与收妥事件留痕一致")
-check("对账头数量 = 成功批次数（BATCH-1,M,U,V,W,M,Q,K,C,D,Z,X 计 11）",
+check("对账头数量 = 成功批次数（BATCH-1/M/U/V/W/Q/K2/C/D/Z/X 计 11）",
       db_scalar("SELECT COUNT(*) FROM batch_reconciliation") == 11)
 check("异常明细不挂事件、收妥明细均挂事件",
       db_scalar("SELECT COUNT(*) FROM batch_reconciliation_item WHERE outcome='exception'"

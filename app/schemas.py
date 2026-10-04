@@ -169,6 +169,8 @@ class BatchReconciliationItemIn(BaseModel):
         须对应原批次该份样本仍有效且处于该笔移交在途状态的事件，
         签收人/封签/时间满足既有单份签收规则——服务层逐项核验。
       * 异常项：填写非空 reason，不得填写 event_id/verified_seal_no；不生成签收事件。
+    两种形态均受历史冻结约束：样本已核定入库时无论按收妥项还是异常项提交，均整单 409
+    （sample_approved）拒绝，不留对账记录、签收事件或版本。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -205,6 +207,8 @@ class BatchReconciliationIn(BaseModel):
       签收人=在途移交接收人、实核封签=登记封签、签收时间晚于移交时间；
       成功时各收妥项作为既有 receive 事件与各样本新版本同事务提交；
     * 异常项（带 reason）仅留对账记录、不生成签收事件、不产生版本；
+    * 批内任一样本已核定入库（历史冻结）：无论其按收妥项还是异常项提交，
+      首次提交均整单 409（sample_approved），不留对账记录、签收事件或新版本；
     * 一个批次只能成功对账一次；并发按已提交状态判定；失败整单拒绝且不留记录。
     """
 

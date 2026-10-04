@@ -278,6 +278,8 @@ def submit_batch_reconciliation_api(batch_id: str, data: BatchReconciliationIn) 
     * 收妥项（event_id + verified_seal_no）：须对应仍有效且处于该笔移交在途状态的事件，
       签收人/封签/时间满足既有单份签收规则；成功时作为既有 receive 事件与各样本新版本同事务提交；
     * 异常项（reason）：仅留对账记录、不生成签收事件；
+    * 批内任一样本已核定入库（历史冻结）：无论其按收妥项还是异常项提交，首次提交均整单
+      409 reconciliation_rejected（明细 sample_approved），不留对账记录、签收事件或新版本；
     * 批次不存在、缺项/重复/外来项、事件号占用、任一收妥项不合格 → 整单拒绝且不留记录
       （409 reconciliation_rejected=已核定/事件号占用；422=清单不合法/收妥项不合格，逐项给出）；
     * 同签收单号同内容重试 → 200 幂等返回原结果；异内容（含跨批次）→ 409 reconciliation_conflict；
