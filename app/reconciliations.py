@@ -7,6 +7,8 @@
     事件，且签收人=在途移交接收人、实核封签=登记封签、签收时间晚于移交时间
     （既有单份签收规则）；成功时各收妥项作为既有 receive 事件与各样本新版本同事务提交；
   * 异常项仅留对账记录、不产生签收事件与版本；
+  * 首次提交时任一批内样本已核定入库 → 无论该份列为收妥项还是异常项，整单 409
+    reconciliation_rejected（明细 sample_approved），不留对账记录、签收事件或新版本；
   * 批次不存在、缺项/重复/外来项、事件号占用、任一收妥项不合格 → 整单拒绝且不留记录；
   * 一个批次只能成功对账一次；同签收单号同内容重试返回原结果（200 幂等），
     异内容（含跨批次复用单号）→ 409 reconciliation_conflict；
@@ -96,24 +98,14 @@ def _validate_received_item(
     receiver: str,
     occurred_iso: str,
     evaluations: dict[int, dict[str, Any]],
-    conflict_items: list[dict[str, Any]],
     invalid_items: list[dict[str, Any]],
 ) -> sqlite3.Row | None:
-    """逐项核验一个收妥项；不合格时向 conflict/invalid 列表追加明细。
+    """逐项核验一个收妥项；不合格时向 invalid 列表追加明细。
 
     通过时返回该份当前有效的在途 transfer 事件行（receive 落库取其移交单号）。
-    409 类（已核定）入 conflict_items，其余 422 入 invalid_items。
+    已核定（sample_approved，409）在调用方对收妥/异常项统一拦截，此处不再检查。
     """
     base = {"index": index, "sample_code": item.sample_code, "event_id": item.event_id}
-
-    # 已核定入库：历史冻结，不得再追加签收
-    if sample["approved_storage_at"]:
-        conflict_items.append({
-            **base,
-            "code": "sample_approved",
-            "message": f"样本 {item.sample_code} 已核定入库（{sample['approved_storage_at']}），禁止追加签收",
-        })
-        return None
 
     # 原批次移交（或其替换后继）必须仍是当前有效 transfer 事件
     eff = get_batch_item_effective_transfer(conn, batch_item["event_row_id"])
@@ -179,7 +171,8 @@ def submit_batch_reconciliation(
     """提交整批对账签收。返回 (对账查询视图, 是否幂等重试)。
 
     全部校验通过后：收妥项 receive 事件 + 各样本新版本 + 对账头/明细同一事务提交，
-    异常项仅写对账明细；任一不合格整单回滚不留记录。
+    异常项仅写对账明细；任一批内样本已核定（无论收妥/异常）或任一其他项不合格，
+    整单回滚不留记录。
     """
     occurred_iso, request_hash = _reconciliation_fingerprint(batch_id, data)
 
@@ -259,6 +252,17 @@ def submit_batch_reconciliation(
         sample = conn.execute("SELECT * FROM sample WHERE id = ?", (batch_item["sample_id"],)).fetchone()
         sample_cache[it.sample_code] = sample
 
+        # 已核定入库：历史冻结——无论该份列为收妥项还是异常项，都不得再借对账签收
+        # 追加任何留痕（异常项同样禁止，否则混合清单会先落对账记录/收妥事件/版本）。
+        if sample["approved_storage_at"]:
+            conflict_items.append({
+                "index": idx, "sample_code": it.sample_code, "event_id": it.event_id,
+                "code": "sample_approved",
+                "message": f"样本 {it.sample_code} 已核定入库（{sample['approved_storage_at']}），"
+                           "历史冻结，禁止以收妥项或异常项追加对账签收",
+            })
+            continue
+
         if not it.is_exception:
             # 4.2 收妥项事件号：清单内重复 / 全局已占用（含历史留痕的失效事件号）
             if it.event_id in seen_events:
@@ -290,7 +294,6 @@ def submit_batch_reconciliation(
                 receiver=data.receiver,
                 occurred_iso=occurred_iso,
                 evaluations=evaluations,
-                conflict_items=conflict_items,
                 invalid_items=invalid_items,
             )
             if eff is not None:
